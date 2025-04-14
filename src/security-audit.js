@@ -3,28 +3,19 @@ import * as path from 'path';
 import { exec } from 'child_process';
 import * as glob from 'glob';
 
-/**
- * @typedef {Object} SecurityAuditResult
- * @property {string[]} hardcodedCredentials
- * @property {string[]} unsafePatterns 
- * @property {string[]} vulnerabilities 
- * @property {string[]} deprecatedDependencies 
- */
-
+// Regular expressions to detect potential hardcoded credentials.
 const hardcodedPatterns = [
   /apikey\s*=\s*['"][a-zA-Z0-9_\-]{32,}['"]/gi,
   /token\s*=\s*['"][a-zA-Z0-9_\-]{32,}['"]/gi,
   /password\s*=\s*['"][^'"]{6,}['"]/gi,
 ];
+
+// Unsafe patterns: calls to eval or exec may be red flags.
 const unsafePatterns = [
   /eval\(/gi,
   /exec\(/gi,
 ];
 
-/**
- * @param {string} projectPath
- * @returns {Promise<string[]>} 
- */
 function runComposerAudit(projectPath) {
   return new Promise((resolve, reject) => {
     exec('composer audit --format=json', { cwd: projectPath }, (error, stdout) => {
@@ -39,14 +30,41 @@ function runComposerAudit(projectPath) {
           for (const [packageName, advisories] of Object.entries(auditReport.advisories)) {
             if (Array.isArray(advisories)) {
               advisories.forEach((adv) => {
-                vulnerabilities.push(
-                  `${packageName} - ${adv.title || 'undefined'}: ${adv.link || 'No URL provided'}`
-                );
+                vulnerabilities.push({
+                  packageName,
+                  advisoryId: adv.advisoryId || undefined,
+                  title: adv.title || 'undefined',
+                  cve: adv.cve || undefined,
+                  link: adv.link || 'No URL provided',
+                  reportedAt: adv.reportedAt || undefined,
+                  severity: adv.severity || undefined,
+                  sources: adv.sources || []
+                });
+              });
+            } else if (typeof advisories === 'object' && advisories !== null) {
+              // If advisories is an object (keys like "2", "3", etc.)
+              Object.values(advisories).forEach((adv) => {
+                vulnerabilities.push({
+                  packageName,
+                  advisoryId: adv.advisoryId || undefined,
+                  title: adv.title || 'undefined',
+                  cve: adv.cve || undefined,
+                  link: adv.link || 'No URL provided',
+                  reportedAt: adv.reportedAt || undefined,
+                  severity: adv.severity || undefined,
+                  sources: adv.sources || []
+                });
               });
             }
           }
         }
-        resolve(vulnerabilities);
+        const deprecatedDependencies = [];
+        if (auditReport.abandoned) {
+          for (const [packageName, replacement] of Object.entries(auditReport.abandoned)) {
+            deprecatedDependencies.push(`${packageName} is abandoned, use ${replacement} instead.`);
+          }
+        }
+        resolve({ vulnerabilities, deprecatedDependencies });
       } catch (parseError) {
         reject(`Error parsing composer audit output: ${parseError}`);
       }
@@ -54,11 +72,6 @@ function runComposerAudit(projectPath) {
   });
 }
 
-/**
- * @param {string[]} files
- * @param {RegExp[]} patterns
- * @returns {string[]}
- */
 function scanFilesForPatterns(files, patterns) {
   const matches = [];
   files.forEach((file) => {
@@ -76,10 +89,6 @@ function scanFilesForPatterns(files, patterns) {
   return matches;
 }
 
-/**
- * @param {string} projectPath 
- * @returns {Promise<string[]>}
- */
 function findDeprecatedDependencies(projectPath) {
   return new Promise((resolve, reject) => {
     exec('composer outdated --format=json', { cwd: projectPath }, (error, stdout) => {
@@ -107,29 +116,28 @@ function findDeprecatedDependencies(projectPath) {
   });
 }
 
-/**
- * @param {string} projectPath
- * @returns {Promise<SecurityAuditResult>}
- */
 export async function runSecurityAudit(projectPath) {
   console.log('Running PHP security audit...');
-
+  
   const files = glob.sync('**/*.{php,html,inc}', { cwd: projectPath, absolute: true });
   const hardcodedCredentials = scanFilesForPatterns(files, hardcodedPatterns);
   const unsafePatternsFound = scanFilesForPatterns(files, unsafePatterns);
 
   let vulnerabilities = [];
+  let deprecatedDependencies = [];
   try {
-    vulnerabilities = await runComposerAudit(projectPath);
+    const result = await runComposerAudit(projectPath);
+    vulnerabilities = result.vulnerabilities;
+    deprecatedDependencies = result.deprecatedDependencies;
   } catch (err) {
     vulnerabilities = [`Error during composer audit: ${err}`];
   }
 
-  let deprecatedDependencies = [];
   try {
-    deprecatedDependencies = await findDeprecatedDependencies(projectPath);
+    const outdatedDeps = await findDeprecatedDependencies(projectPath);
+    deprecatedDependencies = deprecatedDependencies.concat(outdatedDeps);
   } catch (err) {
-    deprecatedDependencies = [`Error during composer outdated: ${err}`];
+    deprecatedDependencies.push(`Error during composer outdated: ${err}`);
   }
 
   return {
@@ -139,8 +147,9 @@ export async function runSecurityAudit(projectPath) {
     deprecatedDependencies,
   };
 }
-// const projectPath = "D:\\Data\\Official\\trial\\php-json-form-submit-master";
+
 const projectPath = "D:\\Data\\Official\\trial\\online-shopping-system-master";
+
 runSecurityAudit(projectPath)
   .then(result => {
     console.log(JSON.stringify({ security: result }, null, 2));
